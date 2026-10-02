@@ -39,3 +39,20 @@ Usa el calendario de Alpaca: respeta feriados, cierres tempranos y el cambio de 
 4. Una sola réplica. Revisar logs: debe decir `Próxima fase: open ...`.
 
 `.env` no se sube (está en `.gitignore` y `.dockerignore`).
+
+## Bot 2: ingreso diario (`income_bot.py`, servicio `income`)
+
+Objetivo: ~US$10+/día en promedio con el menor riesgo posible. Regla validada 2016-2023 → 2024-2026
+(`research/daily_income_backtest.py`): comprar SPY en la subasta de cierre solo si el día cerró en la
+mitad baja de su rango (IBS < 0,5) y vender en la subasta de apertura siguiente. Tamaño ajustado para
+que la variación diaria típica sea ~0,3% del capital; freno a la mitad si los últimos 60 resultados
+son negativos. Cada mañana concilia fills, anota el P&L real y compara con lo esperado.
+
+Corre en su **propia cuenta paper** (Alpaca permite 3): variables `APCA_*` del servicio `income`,
+`RAILWAY_DOCKERFILE_PATH=Dockerfile.income`, volumen en `/data`.
+
+```bash
+.venv/bin/python income_bot.py signal                 # señal de hoy
+.venv/bin/python income_bot.py run --phase entry --dry-run
+.venv/bin/python income_bot.py status
+```
