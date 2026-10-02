@@ -1,0 +1,68 @@
+{
+  "members": [
+    {
+      "last": "Pelosi",
+      "first": "Nancy"
+    },
+    {
+      "last": "Fields",
+      "first": "Cleo"
+    },
+    {
+      "last": "Latta",
+      "first": "Robert"
+    }
+  ],
+  "_size_tiers_pct": "Monto mínimo del rango declarado -> % del equity a comprar. Se usa el tramo más alto cuyo mínimo sea <= al declarado.",
+  "size_tiers_pct": [
+    [
+      1001,
+      0.5
+    ],
+    [
+      15001,
+      1
+    ],
+    [
+      50001,
+      2
+    ],
+    [
+      100001,
+      3
+    ],
+    [
+      250001,
+      4
+    ],
+    [
+      500001,
+      5
+    ],
+    [
+      1000001,
+      7
+    ],
+    [
+      5000001,
+      10
+    ],
+    [
+      25000001,
+      12
+    ]
+  ],
+  "max_position_pct": 20,
+  "cash_only": true,
+  "min_order_usd": 50,
+  "copy_asset_types": [
+    "ST",
+    "OP"
+  ],
+  "skip_option_exercises": true,
+  "skip_donations": true,
+  "park_cash_in": "SPY",
+  "cash_buffer_pct": 1,
+  "rotate_when_short": true,
+  "_backtest": "research/backtest.py — selección y reglas validadas 2024-25 (entrenamiento) vs 2026 (validación)"
+}
