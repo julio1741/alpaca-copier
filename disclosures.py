@@ -44,6 +44,7 @@ class Transaction:
     amount_low: int | None
     description: str = ""
     raw: list[str] = field(default_factory=list)
+    seq: int = 0  # posición de la fila en el reporte: distingue transacciones idénticas (misma fecha y rango)
 
     @property
     def is_purchase(self) -> bool:
@@ -55,7 +56,7 @@ class Transaction:
 
     @property
     def key(self) -> str:
-        return f"{self.doc_id}|{self.ticker}|{self.asset_type}|{self.tx_type}|{self.tx_date}|{self.amount_low}"
+        return f"{self.doc_id}|{self.ticker}|{self.asset_type}|{self.tx_type}|{self.tx_date}|{self.amount_low}|{self.seq}"
 
 
 def list_ptr_filings(year: int, last: str = "Pelosi", first: str = "Nancy") -> list[Filing]:
@@ -182,5 +183,6 @@ def parse_ptr(text: str, doc_id: str) -> list[Transaction]:
             amount_low=amount_low,
             description=" | ".join(desc_parts),
             raw=lines[i:end],
+            seq=n,
         ))
     return txs

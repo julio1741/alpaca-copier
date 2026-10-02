@@ -305,7 +305,8 @@ class Executor:
             return True
 
         order = {"symbol": sym, "side": "buy", "type": "market", "time_in_force": "day",
-                 "client_order_id": f"cp-{p['doc_id']}-{hashlib.sha1(p['key'].encode()).hexdigest()[:12]}"}
+                 "client_order_id": f"cp-{p['doc_id']}-{hashlib.sha1(p['key'].encode()).hexdigest()[:12]}"
+                                    + (f"-r{p['attempts']}" if p.get("attempts") else "")}
         qty = ""
         if asset.get("fractionable"):
             order["notional"] = f"{notional:.2f}"
