@@ -3,5 +3,6 @@
 __pycache__/
 logs/
 state/
+income_data/
 research/cache/
 .DS_Store
