@@ -2,11 +2,11 @@
 """Bot de ingreso diario: ventaja overnight de SPY con filtro de reversión (IBS).
 
 Regla (validada en research/daily_income_backtest.py, 2016-2023 entrenamiento / 2024-2026 validación):
-  - 12 min antes del cierre: IBS = (precio - mínimo) / (máximo - mínimo) del día.
+  - 3 min antes del cierre (12 en modo subasta): IBS = (precio - mínimo) / (máximo - mínimo) del día.
     Si IBS < 0.5 (cerró en la mitad baja de su rango) -> comprar SPY en la subasta de cierre (orden "cls").
   - Tamaño: exposición = min(1, objetivo_std / std de los últimos 20 retornos overnight) x freno.
     Mantiene la pérdida/ganancia diaria típica cerca del objetivo (0,3% del capital ≈ $300 en $100k).
-  - 09:15: vender todo en la subasta de apertura (orden "opg").
+  - 09:31: vender todo (modo "auction": 09:15 en la subasta de apertura "opg").
   - 09:45: conciliar fills, anotar P&L real en la bitácora y actualizar el aprendizaje:
       * métricas móviles 20/60 días (US$/día, % días positivos) vs lo esperado por el backtest;
       * freno: si los últimos 60 días operados son negativos, la exposición se reduce a la mitad
@@ -50,8 +50,11 @@ CFG = {
     "max_exposure": 1.0,
     "brake_lookback_trades": 60,
     "brake_factor": 0.5,
-    "entry_minutes_before_close": 12,
-    "exit_time": "09:15",
+    # "fractional": órdenes de mercado por monto (sirve con cualquier capital; entra 3 min antes del cierre
+    #               y sale 1 min después de la apertura). "auction": acciones enteras en las subastas (cls/opg).
+    "order_mode": "fractional",
+    "entry_minutes_before_close": 3,
+    "exit_time": "09:31",
     "report_time": "09:45",
     "expected_usd_per_active_day_pct": 0.00045,  # backtest validación: ~$45 por día operado en $100k (vol-target)
 }
@@ -153,20 +156,25 @@ def phase_entry(api: Alpaca, st: dict, dry_run: bool) -> None:
                  sig["ibs"], CFG["ibs_threshold"], sig["price"], sig["low"], sig["high"])
         journal_upsert({**row, "qty": 0, "status": "no-signal"})
         return
-    budget = min(equity * sig["exposure"], float(acct["cash"]))
-    qty = int(budget // sig["price"])
-    if qty < 1:
-        log.warning("Señal pero sin plata para 1 acción (presupuesto $%.2f)", budget)
+    budget = math.floor(min(equity * sig["exposure"], float(acct["cash"])) * 100) / 100
+    fractional = CFG["order_mode"] == "fractional"
+    qty = round(budget / sig["price"], 4) if fractional else int(budget // sig["price"])
+    if (fractional and budget < 1) or (not fractional and qty < 1):
+        log.warning("Señal pero sin plata suficiente (presupuesto $%.2f)", budget)
         journal_upsert({**row, "qty": 0, "status": "skipped", "note": "sin plata"})
         return
-    log.info("SEÑAL IBS %.2f < %.2f -> comprar %d %s en la subasta de cierre (~$%.0f, exposición %.0f%%, vol20 %.2f%%)",
-             sig["ibs"], CFG["ibs_threshold"], qty, CFG["symbol"], qty * sig["price"], sig["exposure"] * 100,
-             sig["vol20"] * 100)
+    log.info("SEÑAL IBS %.2f < %.2f -> comprar %s %s por ~$%.2f (%s, exposición %.0f%%, vol20 %.2f%%)",
+             sig["ibs"], CFG["ibs_threshold"], qty, CFG["symbol"], budget if fractional else qty * sig["price"],
+             "orden de mercado" if fractional else "subasta de cierre", sig["exposure"] * 100, sig["vol20"] * 100)
     if dry_run:
         journal_upsert({**row, "qty": qty, "status": "dry-run"})
         return
-    o = api.submit_order(symbol=CFG["symbol"], side="buy", type="market", time_in_force="cls", qty=str(qty),
-                         client_order_id=f"inc-buy-{today}")
+    if fractional:
+        o = api.submit_order(symbol=CFG["symbol"], side="buy", type="market", time_in_force="day",
+                             notional=f"{budget:.2f}", client_order_id=f"inc-buy-{today}")
+    else:
+        o = api.submit_order(symbol=CFG["symbol"], side="buy", type="market", time_in_force="cls", qty=str(qty),
+                             client_order_id=f"inc-buy-{today}")
     st["open"] = {"date": today, "qty": qty, "buy_order": o["id"]}
     save_state(st)
     journal_upsert({**row, "qty": qty, "buy_order": o["id"], "status": "entered"})
@@ -181,18 +189,22 @@ def phase_exit(api: Alpaca, st: dict, dry_run: bool) -> None:
         log.info("La venta ya fue enviada (%s).", pos["sell_order"])
         return
     live = api.position(CFG["symbol"])
-    qty = min(pos["qty"], int(float(live["qty"]))) if live else 0
-    if qty < 1:
+    qty = float(live["qty"]) if live else 0.0
+    if qty <= 0:
         log.warning("La compra de ayer no se llenó; nada que vender.")
         journal_upsert({"date": pos["date"], "status": "not-filled", "pnl_usd": 0})
         st["open"] = None
         save_state(st)
         return
-    log.info("Vender %d %s en la subasta de apertura", qty, CFG["symbol"])
+    fractional = CFG["order_mode"] == "fractional"
+    log.info("Vender %s %s %s", qty, CFG["symbol"], "a mercado tras la apertura" if fractional else "en la subasta de apertura")
     if dry_run:
         return
-    o = api.submit_order(symbol=CFG["symbol"], side="sell", type="market", time_in_force="opg", qty=str(qty),
-                         client_order_id=f"inc-sell-{pos['date']}")
+    if fractional:
+        o = api.close_position(CFG["symbol"]) or {}
+    else:
+        o = api.submit_order(symbol=CFG["symbol"], side="sell", type="market", time_in_force="opg", qty=str(int(qty)),
+                             client_order_id=f"inc-sell-{pos['date']}")
     pos["sell_order"] = o["id"]
     save_state(st)
     journal_upsert({"date": pos["date"], "sell_order": o["id"], "status": "exiting"})
@@ -218,7 +230,7 @@ def phase_report(api: Alpaca, st: dict, dry_run: bool) -> None:
                 ibs_close = round((y["c"] - y["l"]) / (y["h"] - y["l"]), 4) if y["h"] > y["l"] else 0.5
             journal_upsert({"date": pos["date"], "buy_px": bp, "sell_px": sp, "pnl_usd": pnl, "ibs_close": ibs_close,
                             "status": "closed"})
-            log.info("RESULTADO %s: compra %.2f -> venta %.2f x %d = %+.2f USD", pos["date"], bp, sp, int(qty), pnl)
+            log.info("RESULTADO %s: compra %.2f -> venta %.2f x %s = %+.2f USD", pos["date"], bp, sp, qty, pnl)
             st["open"] = None
         elif s and s.get("status") in ("canceled", "expired", "rejected"):
             log.error("La venta %s quedó %s; se reintenta en la próxima fase exit", pos["sell_order"], s["status"])
