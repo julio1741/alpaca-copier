@@ -49,7 +49,7 @@ que la variación diaria típica sea ~0,3% del capital; freno a la mitad si los 
 son negativos. Cada mañana concilia fills, anota el P&L real y compara con lo esperado.
 
 Corre en su **propia cuenta paper** (Alpaca permite 3): variables `APCA_*` del servicio `income`,
-`RAILWAY_DOCKERFILE_PATH=Dockerfile.income`, volumen en `/data`.
+`BOT_CMD="income_bot.py serve"` (mismo Dockerfile que el copiador), volumen en `/data`.
 
 ```bash
 .venv/bin/python income_bot.py signal                 # señal de hoy
