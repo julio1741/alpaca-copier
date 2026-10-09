@@ -13,6 +13,9 @@ Regla (tal como la publicaron; contrastada en research/orb_variants.py, QQQ 2019
   - Tamaño: equity de ayer × min(4, 2% / volatilidad diaria de 14 días), hasta el poder de compra de la cuenta.
     Compras fraccionarias; los cortos solo en acciones enteras (Alpaca no admite cortos fraccionarios ni cortos con
     menos de US$2.000 de equity: en ese caso el corto se omite y queda anotado).
+Cuenta compartida: con NOISE_CAPITAL_USD el bot opera como si tuviera ese capital propio (más su P&L acumulado)
+dentro de una cuenta ajena (la del copiador), cierra solo lo que él abrió y marca sus órdenes con el prefijo "nz-",
+que el copiador descuenta de su caja y sus posiciones.
 Datos: SIP (como el backtest) para todo lo que tenga más de 15 minutos; IEX para el tramo reciente.
 Telemetría: cada orden se compara con el precio que vio la regla al decidir (deslizamiento).
 
@@ -51,6 +54,7 @@ CFG = {
     "flat_minutes_before_close": 2,
     "stale_check_minutes": 5,    # una revisión atrasada más que esto se omite (la regla mira el precio a esa hora)
     "allow_short": True,
+    "capital_usd": float(os.environ["NOISE_CAPITAL_USD"]) if os.environ.get("NOISE_CAPITAL_USD") else None,
 }
 
 FIELDS = ["date", "time", "action", "side", "qty", "theo_px", "fill_px", "slip_pct", "pnl_usd", "upper", "lower",
@@ -209,19 +213,30 @@ def wait_fill(api: Alpaca, oid: str, seconds: int = 30) -> dict:
     raise RuntimeError(f"la orden {oid} no terminó en {seconds}s")
 
 
+def bot_capital(acct: dict) -> float:
+    """Capital con que se dimensiona: el virtual (si la cuenta es compartida) más el P&L acumulado, o el equity de ayer."""
+    if CFG["capital_usd"] is None:
+        return float(acct["last_equity"])
+    return CFG["capital_usd"] + sum(float(r["pnl_usd"]) for r in journal_rows() if r["action"] == "close" and r["pnl_usd"])
+
+
 def open_position(api: Alpaca, st: dict, side: int, theo: float, ctx: dict) -> None:
     day = st["day"]
+    if api.position(CFG["symbol"]):
+        log.warning("La cuenta ya tiene %s de otro origen; no abro para no mezclar posiciones.", CFG["symbol"])
+        journal({**ctx, "action": "skip", "side": side, "theo_px": theo, "note": "posición ajena en la cuenta"})
+        return
     acct = api.account()
-    equity, bp = float(acct["last_equity"]), float(acct["buying_power"])
-    notional = min(equity * day["lev"], bp * 0.98)
+    capital, bp = bot_capital(acct), float(acct["buying_power"])
+    notional = min(capital * day["lev"], bp * 0.98)
     if side == 1:
         qty = math.floor(notional / theo * 1e4) / 1e4
     else:
         qty = math.floor(notional / theo)
-        if equity < 2000:
+        if float(acct["equity"]) < 2000:
             qty = 0
     if qty <= 0:
-        why = "corto omitido: cuenta bajo US$2.000 o sin poder de compra para 1 acción" if side == -1 else "sin poder de compra"
+        why = "corto omitido: cuenta bajo US$2.000 o sin capital para 1 acción" if side == -1 else "sin poder de compra"
         log.info("Señal %s a %.2f, pero %s", "LARGO" if side == 1 else "CORTO", theo, why)
         journal({**ctx, "action": "skip", "side": side, "theo_px": theo, "note": why})
         return
@@ -242,14 +257,18 @@ def open_position(api: Alpaca, st: dict, side: int, theo: float, ctx: dict) -> N
 
 def close_position(api: Alpaca, st: dict, theo: float | None, ctx: dict, reason: str) -> None:
     day = st["day"]
-    if not api.position(CFG["symbol"]):
-        log.warning("No había posición que cerrar (%s).", reason)
+    side = day.get("pos", 0)
+    held = float((api.position(CFG["symbol"]) or {}).get("qty", 0))
+    qty = min(day["qty"], abs(held)) if held * side > 0 else 0   # solo lo propio y solo si sigue ahí
+    if qty <= 0:
+        log.warning("No había posición propia que cerrar (%s).", reason)
         day.update(pos=0)
         save_state(st)
         return
-    o = wait_fill(api, api.close_position(CFG["symbol"])["id"])
+    o = api.submit_order(symbol=CFG["symbol"], side="sell" if side == 1 else "buy", type="market", qty=f"{qty:g}",
+                         time_in_force="day", client_order_id=f"nz-{day['date']}-{ctx['time'].replace(':', '')}-close")
+    o = wait_fill(api, o["id"])
     fill = float(o["filled_avg_price"])
-    side = day.get("pos", 0)
     pnl = side * (fill - day["entry_px"]) * day["qty"] if side else 0.0
     slip = (-side * (fill / theo - 1) * 100) if theo and side else ""
     day.update(pos=0, pnl=day.get("pnl", 0.0) + pnl)
@@ -291,7 +310,7 @@ def phase_flat(api: Alpaca, st: dict) -> None:
     ctx = {"date": str(date.today()), "time": datetime.now(NY).strftime("%H:%M")}
     if day.get("date") == str(date.today()) and day.get("pos"):
         close_position(api, st, last_price(api), ctx, "fin del día")
-    if api.position(CFG["symbol"]):  # red de seguridad: la cuenta es del bot y al cierre debe quedar sin posición
+    if CFG["capital_usd"] is None and api.position(CFG["symbol"]):  # cuenta propia: al cierre, sin posición
         log.warning("Quedaba una posición abierta al cierre; la cierro.")
         wait_fill(api, api.close_position(CFG["symbol"])["id"])
 
@@ -352,8 +371,9 @@ def run_event(api: Alpaca, when: datetime, phase: str) -> None:
 
 
 def serve(api: Alpaca) -> None:
-    log.info("Bot área de ruido iniciado: %s, revisiones cada %d min, volatilidad objetivo %.0f%%, tope %.0fx",
-             CFG["symbol"], CFG["check_every"], CFG["target_vol"] * 100, CFG["max_lev"])
+    log.info("Bot área de ruido iniciado: %s, revisiones cada %d min, volatilidad objetivo %.0f%%, tope %.0fx, capital %s",
+             CFG["symbol"], CFG["check_every"], CFG["target_vol"] * 100, CFG["max_lev"],
+             f"virtual US${CFG['capital_usd']:,.0f} (cuenta compartida)" if CFG["capital_usd"] else "toda la cuenta")
     announced = None
     while True:
         try:

@@ -205,9 +205,37 @@ class Executor:
         acct = self.api.account()
         self.equity = float(acct["equity"])
         self.cash = float(acct["cash"])
-        self.pos = {p["symbol"]: float(p["market_value"]) for p in self.api.positions()}
+        positions = self.api.positions()
+        self.pos = {p["symbol"]: float(p["market_value"]) for p in positions}
+        self._exclude_other_bots({p["symbol"]: float(p["current_price"]) for p in positions})
         self.spy = self.pos.pop(self.park, 0.0) if self.park else 0.0
         self.buffer = self.equity * self.cfg.get("cash_buffer_pct", 0) / 100
+
+    def _exclude_other_bots(self, prices: dict) -> None:
+        """La cuenta la comparte un bot intradía (órdenes con prefijo `other_bot_prefix`, p. ej. el de área de ruido).
+        Se descuenta lo que ese bot movió hoy: su efecto en la caja y su posición, que el copiador no debe estacionar,
+        rotar ni contar como propia."""
+        prefix = self.cfg.get("other_bot_prefix")
+        if not prefix:
+            return
+        since = datetime.combine(date.today(), datetime.min.time()).astimezone().isoformat()
+        orders = self.api._req("GET", f"{self.api.base}/orders",
+                               params={"status": "all", "after": since, "limit": 500, "direction": "asc"}) or []
+        net_qty: dict[str, float] = {}
+        for o in orders:
+            q = float(o.get("filled_qty") or 0)
+            if not (o.get("client_order_id") or "").startswith(prefix) or q <= 0:
+                continue
+            sign = 1 if o["side"] == "buy" else -1
+            self.cash += sign * q * float(o["filled_avg_price"])  # deshace el efecto en la caja
+            net_qty[o["symbol"]] = net_qty.get(o["symbol"], 0.0) + sign * q
+        for sym, q in net_qty.items():
+            if abs(q) < 1e-9 or sym not in self.pos:
+                continue
+            self.pos[sym] -= q * prices.get(sym, 0.0)
+            if abs(self.pos[sym]) < 1.0:
+                del self.pos[sym]
+            log.info("Posición de otro bot excluida: %s %+.4f acciones", sym, q)
 
     def _row(self, p: dict) -> dict:
         return {**p, "mode": self.mode, "ts": datetime.now().isoformat(timespec="seconds")}

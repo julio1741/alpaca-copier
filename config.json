@@ -64,5 +64,6 @@
   "park_cash_in": "SPY",
   "cash_buffer_pct": 1,
   "rotate_when_short": true,
-  "_backtest": "research/backtest.py — selección y reglas validadas 2024-25 (entrenamiento) vs 2026 (validación)"
+  "_backtest": "research/backtest.py — selección y reglas validadas 2024-25 (entrenamiento) vs 2026 (validación)",
+  "other_bot_prefix": "nz-"
 }
