@@ -9,10 +9,14 @@ Regla (validada en research/orb_backtest.py: elegida 2019-2022, validada 2023-20
     toca, cancela el stop y vende a mercado.
   - Solo compras, una operación por día, todo cerrado 2 minutos antes del cierre.
   - Tamaño: arriesga RISK del equity hasta el poder de compra de la cuenta (sin margen = 1x).
+Rango: SIP (mercado consolidado, como el backtest) hasta donde lo permite el plan gratuito (datos de más de 15 min)
+y IEX para el resto; a las 10:15 se recalcula entero con SIP y se corrigen las órdenes si el rango era más ancho.
+Salidas: siempre cerrando la posición real de la cuenta (cuenta dedicada a este bot), nunca una cantidad supuesta;
+así una ejecución parcial (el paper las simula al azar) no deja acciones abiertas de un día para otro.
 Telemetría (lo que decide si la estrategia aguanta): deslizamiento de entrada y salida contra los precios
 teóricos, P&L por operación, y su comparación con el presupuesto de costos del backtest (0,01% ida y vuelta).
 
-Uso: orb_bot.py status | run --phase setup|flat|report [--dry-run] | serve
+Uso: orb_bot.py status | run --phase setup|refine|flat|report [--dry-run] | serve
 """
 from __future__ import annotations
 
@@ -91,16 +95,27 @@ def journal_upsert(row: dict) -> None:
 
 # ---------- mercado ----------
 
-def opening_range(api: Alpaca, day: date) -> tuple[float, float, int]:
+def fetch_bars(api: Alpaca, feed: str, start: datetime, end: datetime) -> list[dict]:
+    if end <= start:
+        return []
+    d = api._req("GET", f"{DATA_URL}/stocks/bars", params={
+        "symbols": CFG["symbol"], "timeframe": "1Min", "feed": feed, "limit": 1000,
+        "start": start.isoformat(), "end": (end - timedelta(seconds=1)).isoformat()})
+    return d["bars"].get(CFG["symbol"], [])
+
+
+def opening_range(api: Alpaca, day: date) -> tuple[float, float, str]:
+    """Máximo y mínimo 09:30-10:00. SIP (lo que usó el backtest) para lo que tenga más de 15 min; IEX para el resto.
+    IEX es una parte del mercado y ve el rango ~0,01-0,02% más estrecho, del orden del costo que decide la estrategia."""
     start = datetime.combine(day, datetime.strptime("09:30", "%H:%M").time(), NY)
     end = start + timedelta(minutes=CFG["or_minutes"])
-    d = api._req("GET", f"{DATA_URL}/stocks/bars", params={
-        "symbols": CFG["symbol"], "timeframe": "1Min", "feed": "iex", "limit": 1000,
-        "start": start.isoformat(), "end": (end - timedelta(seconds=1)).isoformat()})
-    bars = d["bars"].get(CFG["symbol"], [])
+    sip_end = min(end, datetime.now(NY) - timedelta(minutes=16))
+    sip = fetch_bars(api, "sip", start, sip_end)
+    iex = fetch_bars(api, "iex", start, end) if sip_end < end else []
+    bars = sip + iex
     if not bars:
         raise RuntimeError("sin velas del rango de apertura")
-    return max(b["h"] for b in bars), min(b["l"] for b in bars), len(bars)
+    return max(b["h"] for b in bars), min(b["l"] for b in bars), f"{len(sip)} velas SIP + {len(iex)} IEX"
 
 
 def last_price(api: Alpaca) -> float:
@@ -111,11 +126,19 @@ def get_order(api: Alpaca, oid: str) -> dict | None:
     return api._req("GET", f"{api.base}/orders/{oid}") if oid else None
 
 
-def cancel_order(api: Alpaca, oid: str) -> None:
+def cancel_order(api: Alpaca, oid: str) -> dict | None:
+    """Cancela y espera el estado final: la cancelación es asíncrona y la orden aún puede ejecutarse mientras tanto.
+    Devuelve la orden final para que quien llama mire filled_qty antes de mandar otra orden."""
     try:
         api._req("DELETE", f"{api.base}/orders/{oid}")
     except RuntimeError as e:
         log.warning("No se pudo cancelar %s: %s", oid, e)
+    for _ in range(10):
+        o = get_order(api, oid)
+        if not o or o["status"] in ("canceled", "filled", "expired", "rejected"):
+            return o
+        time.sleep(0.5)
+    return get_order(api, oid)
 
 
 # ---------- fases ----------
@@ -125,7 +148,7 @@ def phase_setup(api: Alpaca, st: dict, dry_run: bool) -> None:
     if st.get("day", {}) and st["day"].get("date") == str(today):
         log.info("El día ya está preparado.")
         return
-    hi, lo, n = opening_range(api, today)
+    hi, lo, src = opening_range(api, today)
     rng = hi - lo
     acct = api.account()
     equity, bp = float(acct["equity"]), float(acct["buying_power"])
@@ -136,8 +159,8 @@ def phase_setup(api: Alpaca, st: dict, dry_run: bool) -> None:
         return
     notional = min(equity * CFG["risk"] / (rng / hi), equity * CFG["max_lev"], bp * 0.98)
     qty = math.floor(notional / hi * 1e4) / 1e4
-    log.info("Rango de apertura %s (%d velas IEX): máximo %.2f, mínimo %.2f (%.2f%%). Compra STOP %.4f acc en %.2f (~$%.0f)",
-             CFG["symbol"], n, hi, lo, rng / hi * 100, qty, hi, qty * hi)
+    log.info("Rango de apertura %s (%s): máximo %.2f, mínimo %.2f (%.2f%%). Compra STOP %.4f acc en %.2f (~$%.0f)",
+             CFG["symbol"], src, hi, lo, rng / hi * 100, qty, hi, qty * hi)
     if qty <= 0:
         journal_upsert({**row, "status": "skipped", "note": "sin poder de compra"})
         return
@@ -182,16 +205,11 @@ def manage_tick(api: Alpaca, st: dict) -> None:
         px = last_price(api)
         if px >= day["target_px"]:
             log.info("OBJETIVO tocado (%.2f >= %.2f): cancelo el stop y vendo a mercado", px, day["target_px"])
-            cancel_order(api, day["stop_order"])
-            time.sleep(1)
-            so = get_order(api, day["stop_order"])
+            so = cancel_order(api, day["stop_order"])
             if so and so["status"] == "filled":  # el stop se llenó justo antes de cancelarlo
                 finish(api, st, float(so["filled_avg_price"]), "stop", day["or_low"])
                 return
-            o = api.submit_order(symbol=CFG["symbol"], side="sell", type="market", qty=f"{day['filled_qty']}",
-                                 time_in_force="day", client_order_id=f"orb-target-{day['date']}")
-            fill = wait_fill(api, o["id"])
-            finish(api, st, fill, "objetivo", day["target_px"])
+            close_position(api, st, "objetivo", day["target_px"])
 
 
 def wait_fill(api: Alpaca, oid: str, seconds: int = 30) -> float:
@@ -201,6 +219,62 @@ def wait_fill(api: Alpaca, oid: str, seconds: int = 30) -> float:
             return float(o["filled_avg_price"])
         time.sleep(1)
     raise RuntimeError(f"la orden {oid} no se llenó en {seconds}s")
+
+
+def close_position(api: Alpaca, st: dict, reason: str, theo_px: float | None) -> None:
+    """Vende a mercado toda la posición que la cuenta tenga de verdad (no la cantidad que el bot cree tener)."""
+    if not api.position(CFG["symbol"]):
+        log.warning("No hay posición abierta; nada que vender (%s).", reason)
+        st["day"]["stage"] = "done"
+        save_state(st)
+        return
+    o = api.close_position(CFG["symbol"])
+    finish(api, st, wait_fill(api, o["id"]), reason, theo_px)
+
+
+def refine_range(api: Alpaca, st: dict, dry_run: bool) -> None:
+    """10:15: el rango completo ya está disponible en SIP. Si es más ancho que el usado a las 10:00, corrige la orden
+    de entrada (máximo) o el stop de protección y el objetivo (mínimo)."""
+    day = st.get("day") or {}
+    if day.get("date") != str(date.today()) or day.get("stage") not in ("waiting_breakout", "in_trade"):
+        return
+    start = datetime.combine(date.today(), datetime.strptime("09:30", "%H:%M").time(), NY)
+    bars = fetch_bars(api, "sip", start, start + timedelta(minutes=CFG["or_minutes"]))
+    if not bars:
+        log.warning("Sin velas SIP para recalcular el rango.")
+        return
+    hi, lo = max(b["h"] for b in bars), min(b["l"] for b in bars)
+    log.info("Rango SIP completo: máximo %.2f (usado %.2f), mínimo %.2f (usado %.2f)", hi, day["or_high"], lo, day["or_low"])
+    if dry_run:
+        return
+    if day["stage"] == "waiting_breakout" and round(hi, 2) > round(day["or_high"], 2):
+        o = cancel_order(api, day["entry_order"])
+        if o and float(o.get("filled_qty") or 0) > 0:
+            log.info("La entrada ya se había ejecutado; sigo con el rango anterior.")
+            return
+        new = api.submit_order(symbol=CFG["symbol"], side="buy", type="stop", stop_price=f"{hi:.2f}", qty=f"{day['qty']}",
+                               time_in_force="day", client_order_id=f"orb-entry-{day['date']}-sip")
+        day.update(or_high=hi, entry_order=new["id"])
+        journal_upsert({"date": day["date"], "or_high": hi, "entry_order": new["id"], "note": "rango corregido con SIP"})
+        log.info("Compra STOP movida a %.2f", hi)
+    if round(lo, 2) < round(day["or_low"], 2):
+        day["or_low"] = lo
+        if day["stage"] == "in_trade" and day.get("stop_order"):
+            so = cancel_order(api, day["stop_order"])
+            if so and so["status"] == "filled":
+                finish(api, st, float(so["filled_avg_price"]), "stop", float(so["stop_price"]))
+                return
+            pos = api.position(CFG["symbol"])
+            if not pos:
+                return
+            new = api.submit_order(symbol=CFG["symbol"], side="sell", type="stop", stop_price=f"{lo:.2f}",
+                                   qty=pos["qty"], time_in_force="day", client_order_id=f"orb-stop-{day['date']}-sip")
+            day.update(stop_order=new["id"], target_px=day["entry_px"] + CFG["target_r"] * (day["entry_px"] - lo))
+            journal_upsert({"date": day["date"], "stop_order": new["id"], "target_px": round(day["target_px"], 2),
+                            "note": "rango corregido con SIP"})
+            log.info("Stop movido a %.2f; objetivo %.2f", lo, day["target_px"])
+        journal_upsert({"date": day["date"], "or_low": lo})
+    save_state(st)
 
 
 def finish(api: Alpaca, st: dict, exit_px: float, reason: str, theo_px: float | None) -> None:
@@ -218,13 +292,20 @@ def finish(api: Alpaca, st: dict, exit_px: float, reason: str, theo_px: float | 
 
 def phase_flat(api: Alpaca, st: dict, dry_run: bool) -> None:
     day = st.get("day") or {}
-    if day.get("date") != str(date.today()) or dry_run:
+    if dry_run:
         return
+    if day.get("date") == str(date.today()):
+        flatten_day(api, st, day)
+    if api.position(CFG["symbol"]):  # red de seguridad: la cuenta es del bot y al cierre debe quedar sin posición
+        log.warning("Quedaba una posición abierta al cierre; la cierro.")
+        wait_fill(api, api.close_position(CFG["symbol"])["id"])
+
+
+def flatten_day(api: Alpaca, st: dict, day: dict) -> None:
     if day.get("stage") == "waiting_breakout":
-        cancel_order(api, day["entry_order"])
-        o = get_order(api, day["entry_order"])
-        if o and o["status"] == "filled":
-            day["stage"] = "in_trade"  # se llenó en el último segundo: se cierra abajo
+        o = cancel_order(api, day["entry_order"])
+        if o and float(o.get("filled_qty") or 0) > 0:  # se llenó (o en parte) en el último momento: se cierra abajo
+            day["stage"] = "in_trade"
             day.update(entry_px=float(o["filled_avg_price"]), filled_qty=float(o["filled_qty"]), stop_order="")
         else:
             day["stage"] = "done"
@@ -234,21 +315,11 @@ def phase_flat(api: Alpaca, st: dict, dry_run: bool) -> None:
             return
     if day.get("stage") == "in_trade":
         if day.get("stop_order"):
-            cancel_order(api, day["stop_order"])
-            so = get_order(api, day["stop_order"])
+            so = cancel_order(api, day["stop_order"])
             if so and so["status"] == "filled":  # el stop se ejecutó mientras se cancelaba
                 finish(api, st, float(so["filled_avg_price"]), "stop", day["or_low"])
                 return
-        pos = api.position(CFG["symbol"])  # vender solo lo que realmente hay, nunca quedar en corto
-        qty = min(float(day["filled_qty"]), float(pos["qty"])) if pos else 0.0
-        if qty <= 0:
-            log.warning("No hay posición abierta al cierre; nada que vender.")
-            day["stage"] = "done"
-            save_state(st)
-            return
-        o = api.submit_order(symbol=CFG["symbol"], side="sell", type="market", qty=f"{qty}",
-                             time_in_force="day", client_order_id=f"orb-flat-{day['date']}")
-        finish(api, st, wait_fill(api, o["id"]), "fin del día", None)
+        close_position(api, st, "fin del día", None)
 
 
 def phase_report(api: Alpaca, st: dict, dry_run: bool) -> None:
@@ -269,7 +340,7 @@ def phase_report(api: Alpaca, st: dict, dry_run: bool) -> None:
              CFG["cost_budget_rt"] * 100)
 
 
-PHASES = {"setup": phase_setup, "flat": phase_flat, "report": phase_report}
+PHASES = {"setup": phase_setup, "refine": refine_range, "flat": phase_flat, "report": phase_report}
 
 
 def events(api: Alpaca, now: datetime) -> list[tuple[datetime, datetime, str]]:
@@ -280,6 +351,7 @@ def events(api: Alpaca, now: datetime) -> list[tuple[datetime, datetime, str]]:
         op = datetime.combine(day, datetime.strptime(d["open"], "%H:%M").time(), NY)
         cl = datetime.combine(day, datetime.strptime(d["close"], "%H:%M").time(), NY)
         out.append((op + timedelta(minutes=CFG["or_minutes"], seconds=20), cl, "setup"))
+        out.append((op + timedelta(minutes=CFG["or_minutes"] + 16), cl, "refine"))
         out.append((cl - timedelta(minutes=CFG["flat_minutes_before_close"]), cl, "flat"))
         out.append((cl + timedelta(minutes=5), cl, "report"))
     return sorted(out)
